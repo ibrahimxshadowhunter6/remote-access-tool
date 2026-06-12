@@ -989,7 +989,7 @@ def create_app():
     # Routes
     app.router.add_get("/", handle_index)
     app.router.add_get("/ws", handle_ws)
-    app.router.add_post("/webhook", handle_webhook)
+    app.router.add_post("/", handle_webhook)
     app.router.add_get("/health", handle_health)
 
     app.on_startup.append(on_startup)
